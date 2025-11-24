@@ -52,7 +52,7 @@ class MetricsLogger:
         row = asdict(m)
         fieldnames = list(row.keys())
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(self.path, "a", newline="", encoding="utf-8") as f:
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             if not self._initialized:
                 writer.writeheader()
