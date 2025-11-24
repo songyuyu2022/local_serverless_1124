@@ -1,0 +1,92 @@
+edition: 1.0.0
+name: moe-experts-split-full
+access: default
+services:
+  pre-fn:
+    component: fc
+    props:
+      region: cn-hangzhou
+      service:
+        name: moe-svc
+        vpcConfig:
+          vpcId: vpc-bp1rycmqfmwplkf0ihmbe
+          vswitchIds: vsw-bp1po0qwhbemlga0ng4og
+          securityGroupId: sg-bp12t8bjr33m6fkzgfwy
+        internetAccess: false
+        logConfig: auto
+      function:
+        name: pre-fn
+        runtime: custom-container
+        timeout: 120
+        memorySize: 4096
+        cpu: 2
+        customContainerConfig:
+          image: crpi-vgvqvbk1g2kj9pcq.cn-hangzhou.personal.cr.aliyuncs.com/moe1112/moe-pre:latest
+          port: 9000
+      triggers:
+        - name: http
+          type: http
+          config: { authType: anonymous, methods: ["POST"] }
+  post-fn:
+    component: fc
+    props:
+      region: cn-hangzhou
+      service:
+        name: moe-svc
+      function:
+        name: post-fn
+        runtime: custom-container
+        timeout: 120
+        memorySize: 4096
+        cpu: 2
+        customContainerConfig:
+          image: crpi-vgvqvbk1g2kj9pcq.cn-hangzhou.personal.cr.aliyuncs.com/moe1112/moe-post:latest
+          port: 9001
+      triggers:
+        - name: http
+          type: http
+          config: { authType: anonymous, methods: ["POST"] }
+  expert-e0:
+    component: fc
+    props:
+      region: cn-hangzhou
+      service:
+        name: moe-svc
+      function:
+        name: expert-e0
+        runtime: custom-container
+        timeout: 120
+        memorySize: 4096
+        cpu: 2
+        customContainerConfig:
+          image: crpi-vgvqvbk1g2kj9pcq.cn-hangzhou.personal.cr.aliyuncs.com/moe1112/moe-expert:latest
+          port: 9002
+        environmentVariables:
+          EXPERT_ID: "0"
+          EMB_DIM: "256"
+      triggers:
+        - name: http
+          type: http
+          config: { authType: anonymous, methods: ["POST"] }
+  expert-e1:
+    component: fc
+    props:
+      region: cn-hangzhou
+      service:
+        name: moe-svc
+      function:
+        name: expert-e1
+        runtime: custom-container
+        timeout: 120
+        memorySize: 4096
+        cpu: 2
+        customContainerConfig:
+          image: crpi-vgvqvbk1g2kj9pcq.cn-hangzhou.personal.cr.aliyuncs.com/moe1112/moe-expert:latest
+          port: 9002
+        environmentVariables:
+          EXPERT_ID: "1"
+          EMB_DIM: "256"
+      triggers:
+        - name: http
+          type: http
+          config: { authType: anonymous, methods: ["POST"] }
