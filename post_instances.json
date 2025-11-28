@@ -1,0 +1,24 @@
+[
+  {
+    "id": "post-a",
+    "url": "http://127.0.0.1:9001",
+    "meta": {
+      "rtt_ms": 1.5,
+      "price_cents_s": 1.2
+    },
+    "dyn": {
+      "avg_q_ms": 0.0
+    }
+  },
+  {
+    "id": "post-b",
+    "url": "http://127.0.0.1:9003",
+    "meta": {
+      "rtt_ms": 4.0,
+      "price_cents_s": 0.6
+    },
+    "dyn": {
+      "avg_q_ms": 0.0
+    }
+  }
+]

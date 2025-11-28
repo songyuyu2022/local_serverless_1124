@@ -11,12 +11,15 @@ from shared import dumps, loads, tensor_to_pack, pack_to_tensor
 from nsga2_bw import nsga2_select
 from utils.logger import log
 from dataset import LMTextBatcher, DATA_PATH_DEFAULT
+from scheduler_lgbm import select_instance_generic
+from scheduler_hybrid import HYBRID_SCHED  # ★ 新增：混合调度器
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------------------------------------------------------
 # 基本配置
 # ------------------------------------------------------------------
+# 仍然保留 PRE_URL / POST_URL 作为 fallback，主要用 PRE_INSTANCES / POST_INSTANCES
 PRE_URL = os.getenv("PRE_URL", "http://127.0.0.1:9000")
 POST_URL = os.getenv("POST_URL", "http://127.0.0.1:9001")
 
@@ -25,6 +28,23 @@ USE_NSGA2 = os.getenv("USE_NSGA2", "1") == "1"
 # 优先从 JSON 文件读专家实例配置，默认文件名 experts.json
 CONFIG_PATH = os.getenv("EXP_INSTANCES_FILE", "experts.json")
 
+# 从环境变量或文件中读取 pre / post 实例信息
+def load_instances(env_key: str, default_file: str):
+    txt = os.getenv(env_key)
+    if txt:
+        return json.loads(txt)
+    try:
+        with open(default_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        log("controller", f"config file {default_file} not found, {env_key} empty")
+        return []
+
+PRE_INSTANCES = load_instances("PRE_INSTANCES_JSON", "pre_instances.json")
+POST_INSTANCES = load_instances("POST_INSTANCES_JSON", "post_instances.json")
+
+USE_HYBRID = os.getenv("USE_HYBRID", "1") == "1"
+USE_LGBM = os.getenv("USE_LGBM", "1") == "1"
 
 def load_expert_instances(path: str):
     try:
@@ -39,13 +59,13 @@ def load_expert_instances(path: str):
         log("controller", f"ERROR loading {path}: {e}")
         return {}
 
-
 EXPERT_INSTANCES = load_expert_instances(CONFIG_PATH)
 
 MICRO_BATCHES = int(os.getenv("MICRO_BATCHES", "4"))  # 暂时未用
 BLOCK = int(os.getenv("BLOCK_SIZE", "8"))
 BATCH = int(os.getenv("BATCH_SIZE", "4"))
 STEP_PERIOD_MS = float(os.getenv("STEP_PERIOD_MS", "50"))
+EMB_DIM = int(os.getenv("EMB_DIM", "256"))  # ★ 新增：embedding 维度，用作调度特征
 
 NUM_EPOCHS = int(os.getenv("NUM_EPOCHS", "1"))          # 总 epoch 数
 VAL_SPLIT_RATIO = float(os.getenv("VAL_SPLIT_RATIO", "0.9"))  # 训练/验证切分比例
@@ -97,6 +117,131 @@ def est_grad_bytes(grads: dict) -> float:
         total *= 0.5
     return float(total)
 
+# ------------------------------------------------------------------
+# 通过调度器调用 pre / post 的 /fwd（会返回使用的实例，用于后续 bwd/step）
+# ------------------------------------------------------------------
+async def call_pre_fwd(x_ids_pack, micro_id: int, tokens: int, emb_dim: int):
+    """
+    通过调度器选择一个 pre 实例，调用 /fwd
+    返回: (resp_dict, latency_ms, instance_dict)
+    """
+    if not PRE_INSTANCES:
+        # 如果没配多实例，就用 PRE_URL fallback
+        inst = {"id": "pre-default", "url": PRE_URL, "meta": {"rtt_ms": 0.0}, "dyn": {}}
+        insts = [inst]
+    else:
+        insts = PRE_INSTANCES
+
+    req_feat = {
+        "tokens": tokens,
+        "emb_dim": emb_dim,
+    }
+
+    # 选择实例：func_type="pre", logical_id 用 0 即可
+    if USE_HYBRID and len(insts) > 1:
+        inst, score = HYBRID_SCHED.select_instance(
+            func_type="pre",
+            logical_id=0,
+            instances=insts,
+            req=req_feat,
+        )
+    elif USE_LGBM and len(insts) > 1:
+        inst, score = select_instance_generic(
+            func_type="pre",
+            logical_id=0,
+            instances=insts,
+            req=req_feat,
+        )
+    else:
+        inst, score = insts[0], 0.0
+
+    url = inst["url"] + "/fwd"
+    log("controller", f"call pre /fwd -> inst={inst.get('id')} score={score:.3f}")
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        t0 = time.time()
+        r = await client.post(
+            url,
+            content=dumps({"x_ids": x_ids_pack, "micro_id": micro_id}),
+            headers={"Content-Type": "application/msgpack"},
+        )
+        latency_ms = (time.time() - t0) * 1000.0
+
+    if USE_HYBRID:
+        try:
+            HYBRID_SCHED.online_update(
+                func_type="pre",
+                logical_id=0,
+                inst=inst,
+                req=req_feat,
+                latency_ms=latency_ms,
+            )
+        except Exception as e:
+            log("controller", f"HYBRID_SCHED update error (pre): {e}")
+
+    resp = loads(r.content)
+    return resp, latency_ms, inst
+
+
+async def call_post_fwd(y_pack, targets_pack, micro_id: int, tokens: int, emb_dim: int):
+    """
+    通过调度器选择一个 post 实例，调用 /fwd
+    返回: (resp_dict, latency_ms, instance_dict)
+    """
+    if not POST_INSTANCES:
+        inst = {"id": "post-default", "url": POST_URL, "meta": {"rtt_ms": 0.0}, "dyn": {}}
+        insts = [inst]
+    else:
+        insts = POST_INSTANCES
+
+    req_feat = {
+        "tokens": tokens,
+        "emb_dim": emb_dim,
+    }
+
+    if USE_HYBRID and len(insts) > 1:
+        inst, score = HYBRID_SCHED.select_instance(
+            func_type="post",
+            logical_id=0,
+            instances=insts,
+            req=req_feat,
+        )
+    elif USE_LGBM and len(insts) > 1:
+        inst, score = select_instance_generic(
+            func_type="post",
+            logical_id=0,
+            instances=insts,
+            req=req_feat,
+        )
+    else:
+        inst, score = insts[0], 0.0
+
+    url = inst["url"] + "/fwd"
+    log("controller", f"call post /fwd -> inst={inst.get('id')} score={score:.3f}")
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        t0 = time.time()
+        r = await client.post(
+            url,
+            content=dumps({"y": y_pack, "targets": targets_pack, "micro_id": micro_id}),
+            headers={"Content-Type": "application/msgpack"},
+        )
+        latency_ms = (time.time() - t0) * 1000.0
+
+    if USE_HYBRID:
+        try:
+            HYBRID_SCHED.online_update(
+                func_type="post",
+                logical_id=0,
+                inst=inst,
+                req=req_feat,
+                latency_ms=latency_ms,
+            )
+        except Exception as e:
+            log("controller", f"HYBRID_SCHED update error (post): {e}")
+
+    resp = loads(r.content)
+    return resp, latency_ms, inst
 
 # ------------------------------------------------------------------
 # 单次 step：既可以是 train，也可以是 val
@@ -137,47 +282,54 @@ async def run_step(phase: str, epoch_idx: int, step_in_epoch: int, global_step: 
     expert_inst_cnt = 0
     expert_comm_ms = 0.0
 
+    # 在本 step 内，pre / post 的 URL 由调度器选择后固定下来
+    pre_url_for_step = PRE_URL
+    post_url_for_step = POST_URL
+
     try:
         async with httpx.AsyncClient(timeout=None) as client:
-            # ------------------ 前向：pre_fn ------------------
+            # ------------------ 前向：pre_fn（通过调度器选实例） ------------------
             t_pre_fwd_start = time.perf_counter()
-            log("controller", f"[{phase}] → Call pre_fn /fwd")
-            rpre = await client.post(
-                PRE_URL + "/fwd",
-                content=dumps({"x_ids": tensor_to_pack(x_ids), "micro_id": global_step}),
-                headers={"Content-Type": "application/msgpack"},
+            log("controller", f"[{phase}] → Call pre_fn /fwd (via scheduler)")
+            pre_resp, pre_lat_ms, pre_inst = await call_pre_fwd(
+                x_ids_pack=tensor_to_pack(x_ids),
+                micro_id=global_step,
+                tokens=tokens,
+                emb_dim=EMB_DIM,
             )
             t_pre_fwd_end = time.perf_counter()
 
-            pre_out = loads(rpre.content)
-            y = pack_to_tensor(pre_out["y"], device)
-            log("controller", f"[{phase}] pre_fn /fwd done, y shape={tuple(y.shape)}")
+            pre_url_for_step = pre_inst["url"]
+            y = pack_to_tensor(pre_resp["y"], device)
+            log(
+                "controller",
+                f"[{phase}] pre_fn /fwd done, y shape={tuple(y.shape)}, inst={pre_inst.get('id')}",
+            )
 
-            # ------------------ 前向：post_fn ------------------
+            # ------------------ 前向：post_fn（通过调度器选实例） ------------------
             t_post_fwd_start = time.perf_counter()
-            log("controller", f"[{phase}] → Call post_fn /fwd")
-            rpost_fwd = await client.post(
-                POST_URL + "/fwd",
-                content=dumps({
-                    "y": tensor_to_pack(y),
-                    "targets": tensor_to_pack(target_ids),
-                    "micro_id": global_step,
-                }),
-                headers={"Content-Type": "application/msgpack"},
+            log("controller", f"[{phase}] → Call post_fn /fwd (via scheduler)")
+            post_resp, post_lat_ms, post_inst = await call_post_fwd(
+                y_pack=tensor_to_pack(y),
+                targets_pack=tensor_to_pack(target_ids),
+                micro_id=global_step,
+                tokens=tokens,
+                emb_dim=EMB_DIM,
             )
             t_post_fwd_end = time.perf_counter()
 
-            post_fwd_out = loads(rpost_fwd.content)
-            stash = post_fwd_out["stash"]
+            post_url_for_step = post_inst["url"]
+            stash = post_resp["stash"]
 
             # 读取 post_fn 计算的指标
-            m = post_fwd_out.get("metrics", {})
-            loss_val = m.get("loss", post_fwd_out.get("loss"))
+            m = post_resp.get("metrics", {})
+            loss_val = m.get("loss", post_resp.get("loss"))
             acc1 = m.get("acc_top1")
             acc5 = m.get("acc_top5")
             log(
                 "controller",
-                f"[{phase}] post_fn /fwd metrics: loss={loss_val}, acc1={acc1}, acc5={acc5}",
+                f"[{phase}] post_fn /fwd metrics: loss={loss_val}, acc1={acc1}, acc5={acc5}, "
+                f"inst={post_inst.get('id')}",
             )
 
             # ------------------ 仅 train 才做反向和更新 ------------------
@@ -186,7 +338,7 @@ async def run_step(phase: str, epoch_idx: int, step_in_epoch: int, global_step: 
                 t_post_bwd_start = time.perf_counter()
                 log("controller", "[train] ← Call post_fn /bwd")
                 rb = await client.post(
-                    POST_URL + "/bwd",
+                    post_url_for_step + "/bwd",
                     content=dumps({"stash": stash}),
                     headers={"Content-Type": "application/msgpack"},
                 )
@@ -200,7 +352,7 @@ async def run_step(phase: str, epoch_idx: int, step_in_epoch: int, global_step: 
                 t_pre_bwd_start = time.perf_counter()
                 log("controller", "[train] ← Call pre_fn /bwd")
                 await client.post(
-                    PRE_URL + "/bwd",
+                    pre_url_for_step + "/bwd",
                     content=dumps(
                         {"x_ids": tensor_to_pack(x_ids), "dy": tensor_to_pack(dy)}
                     ),
@@ -270,12 +422,12 @@ async def run_step(phase: str, epoch_idx: int, step_in_epoch: int, global_step: 
                 else:
                     log("controller", "[train] No expert_grads returned from post_fn, skip experts")
 
-                # step 所有模块
+                # step 所有模块（pre / post 用本 step 选中的实例）
                 log("controller", "[train] → Call pre_fn /step")
-                await client.post(PRE_URL + "/step")
+                await client.post(pre_url_for_step + "/step")
 
                 log("controller", "[train] → Call post_fn /step")
-                await client.post(POST_URL + "/step")
+                await client.post(post_url_for_step + "/step")
 
                 for eid, inst_list in EXPERT_INSTANCES.items():
                     for inst in inst_list:
@@ -311,35 +463,27 @@ async def run_step(phase: str, epoch_idx: int, step_in_epoch: int, global_step: 
         # 记录到 CSV（train / val 都记录）
         metrics_logger.log(
             StepMetrics(
-                # use_lgbm: Optional[int] = None,
-                # use_nsga2: Optional[int] = None,
                 epoch=epoch_idx,
                 step=global_step,
                 step_in_epoch=step_in_epoch,
                 phase=phase,
+
                 loss=loss_val,
                 acc_top1=acc1,
                 acc_top5=acc5,
-                batch_size=BATCH,
-                seq_len=BLOCK,
-                tokens=tokens,
+
                 step_time_ms=step_time_ms,
-                pre_fwd_ms=pre_fwd_ms,
-                post_fwd_ms=post_fwd_ms,
-                post_bwd_ms=post_bwd_ms,
-                pre_bwd_ms=pre_bwd_ms,
-                expert_comm_ms=expert_comm_ms,
-                samples_per_s=samples_per_s,
                 tokens_per_s=tokens_per_s,
-                expert_grad_bytes=grad_bytes,
-                expert_instances=expert_inst_cnt,
+                expert_comm_ms=expert_comm_ms,
+
+                use_lgbm=int(USE_LGBM),
+                use_nsga2=int(USE_NSGA2),
             )
         )
 
     except Exception as e:
         log("controller", f"ERROR in run_step(phase={phase}, epoch={epoch_idx}, step={step_in_epoch}): {e}")
         raise
-
 
 # ------------------------------------------------------------------
 # 主训练循环：NUM_EPOCHS × (train + val)

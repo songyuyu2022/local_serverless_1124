@@ -2,26 +2,46 @@
   "0": [
     {
       "id": "e0-a",
-      "url": "http://127.0.0.1:9002",
+      "url": "http://127.0.0.1:9100",
       "meta": {
-        "price_cents_s": 0.01,
-        "rtt_ms": 3
+        "rtt_ms": 2.0,
+        "price_cents_s": 1.0
       },
       "dyn": {
-        "avg_q_ms": 1
+        "avg_q_ms": 0.0
       }
-    }
-  ],
-  "1": [
+    },
     {
-      "id": "e1-a",
-      "url": "http://127.0.0.1:9003",
+      "id": "e0-b",
+      "url": "http://127.0.0.1:9101",
       "meta": {
-        "price_cents_s": 0.01,
-        "rtt_ms": 3
+        "rtt_ms": 3.0,
+        "price_cents_s": 0.8
       },
       "dyn": {
-        "avg_q_ms": 1
+        "avg_q_ms": 0.0
+      }
+    },
+    {
+      "id": "e0-c",
+      "url": "http://127.0.0.1:9102",
+      "meta": {
+        "rtt_ms": 5.0,
+        "price_cents_s": 0.5
+      },
+      "dyn": {
+        "avg_q_ms": 0.0
+      }
+    },
+    {
+      "id": "e0-d",
+      "url": "http://127.0.0.1:9103",
+      "meta": {
+        "rtt_ms": 7.0,
+        "price_cents_s": 0.3
+      },
+      "dyn": {
+        "avg_q_ms": 0.0
       }
     }
   ]
